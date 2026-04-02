@@ -1,0 +1,152 @@
+#!/bin/bash
+
+# --- Константы и настройки ---
+LDB_PATH="/var/lib/samba/private/sam.ldb"
+BACKUP_DIR="/var/lib/samba/backup"
+# GUID для контейнера пользователей (Users)
+USERS_GUID="A9D1CA15768811D1ADED00C04FD8D5CD"
+CREATE_FLAG=0
+TARGET_OU_PATH=""
+
+# --- Функции ---
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+show_help() {
+    cat << EOF
+Использование: $0 <OU-path> [--ldb <path>] [--create] [--help]
+
+Описание:
+    Переназначает контейнер для новых учетных записей ПОЛЬЗОВАТЕЛЕЙ в Samba AD.
+    Создает файл бэкапа, пригодный для восстановления через ldbmodify.
+
+Параметры:
+    OU-path                 Путь к подразделению без корня домена
+                            Пример: OU=Staff,OU=Corporate
+    --ldb <path>            Путь к базе данных sam.ldb (по умолчанию: $LDB_PATH)
+    --create                Создать указанные OU, если они не существуют
+    --help                  Показать эту справку
+
+Примеры:
+    $0 "OU=Users,OU=Office" --create
+EOF
+    exit 0
+}
+
+check_exists_ldb() {
+    if [[ ! -f "$LDB_PATH" ]]; then
+        log "✗ Ошибка: файл базы данных не найден по адресу: $LDB_PATH"
+        log "Убедитесь, что путь указан верно или используйте параметр --ldb <путь>."
+        exit 1
+    fi 
+    ldbsearch -H "$LDB_PATH" -b "$1" -s base dn > /dev/null 2>&1
+}
+
+# --- Обработка аргументов ---
+
+if [[ $# -eq 0 ]]; then show_help; fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --help) show_help ;;
+        --create) CREATE_FLAG=1; shift ;;
+        --ldb) LDB_PATH="$2"; shift 2 ;;
+        *) TARGET_OU_PATH="$1"; shift ;;
+    esac
+done
+
+# --- Начало работы ---
+
+log "=== Начало переназначения контейнера для учетных записей ПОЛЬЗОВАТЕЛЕЙ ==="
+
+# Получаем Base DN
+BASE_DN=$(ldbsearch -H "$LDB_PATH" -b "" -s base defaultNamingContext | grep "^defaultNamingContext" | awk '{print $2}' | tr -d ' ')
+FULL_TARGET_DN="${TARGET_OU_PATH},${BASE_DN}"
+
+log "Параметры:"
+log "  OU путь: $TARGET_OU_PATH"
+log "  Корень домена: $BASE_DN"
+log "  Полный DN OU: $FULL_TARGET_DN"
+
+# --- Проверка/Создание OU ---
+
+if ! check_exists_ldb "$FULL_TARGET_DN"; then
+    if [ "$CREATE_FLAG" -eq 1 ]; then
+        log "Подразделение $TARGET_OU_PATH не существует, создаем..."
+        IFS=',' read -r -a parts <<< "$TARGET_OU_PATH"
+        curr=""
+        for (( i=${#parts[@]}-1; i>=0; i-- )); do
+            curr="${parts[i]}${curr:+,}${curr}"
+            if ! check_exists_ldb "${curr},${BASE_DN}"; then
+                log "  Создание OU: $curr"
+                samba-tool ou add "$curr" > /dev/null 2>&1
+                log "  ✓ OU создан: $curr"
+            fi
+        done
+    else
+        log "✗ Ошибка: подразделение $TARGET_OU_PATH не существует. Используйте --create."
+        exit 1
+    fi
+fi
+
+# --- Создание бэкапа ---
+
+mkdir -p "$BACKUP_DIR"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BACKUP_DIR}/users_wko_restore_${TIMESTAMP}.ldif"
+RAW_TEMP="/tmp/usr_wko_raw_$$.tmp"
+
+# Выгружаем текущее состояние
+ldbsearch -H "$LDB_PATH" -b "$BASE_DN" -s base wellKnownObjects > "$RAW_TEMP"
+
+# Формируем файл бэкапа как готовую инструкцию ldbmodify
+{
+    echo "dn: $BASE_DN"
+    echo "changetype: modify"
+    echo "replace: wellKnownObjects"
+    awk 'BEGIN{L=""} {if(sub(/^[ ]/,"")){L=L $0}else{if(L!="")print L; L=$0}} END{print L}' "$RAW_TEMP" | grep "^wellKnownObjects: "
+    echo "-"
+} > "$BACKUP_FILE"
+
+rm -f "$RAW_TEMP"
+
+if [ ! -s "$BACKUP_FILE" ]; then
+    log "✗ Ошибка при создании файла бэкапа."
+    exit 1
+fi
+log "✓ Бэкап (формат ldbmodify) создан: $BACKUP_FILE"
+
+# --- Подготовка новых данных ---
+
+NEW_WKO_BLOCK=$(cat "$BACKUP_FILE" | grep "^wellKnownObjects: " | while read -r line; do
+    if [[ "$line" =~ "$USERS_GUID" ]]; then
+        echo "wellKnownObjects: B:32:${USERS_GUID}:${FULL_TARGET_DN}"
+    else
+        echo "$line"
+    fi
+done)
+
+# --- Применение ---
+
+MOD_LDIF="/tmp/usr_wko_mod_$$.ldif"
+{
+    echo "dn: $BASE_DN"
+    echo "changetype: modify"
+    echo "replace: wellKnownObjects"
+    echo "$NEW_WKO_BLOCK"
+    echo "-"
+} > "$MOD_LDIF"
+
+log "Применение изменений в базе данных (перенос Users)..."
+ldbmodify -H "$LDB_PATH" "$MOD_LDIF" > /dev/null 2>&1
+
+if [ $? -eq 0 ]; then
+    log "✓ Успешно! Контейнер пользователей переназначен."
+    log "Для ОТКАТА выполните: ldbmodify -H \"$LDB_PATH\" $BACKUP_FILE"
+    rm -f "$MOD_LDIF"
+else
+    log "✗ Ошибка ldbmodify. Проверьте $MOD_LDIF"
+    exit 1
+fi
